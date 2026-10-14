@@ -28,13 +28,23 @@ def partir_texto(texto, limite=450):
     return pedacos
 
 
+def email_mymemory():
+    # Opcional: com email o MyMemory permite muito mais caracteres por dia
+    try:
+        return st.secrets.get("MYMEMORY_EMAIL", None)
+    except Exception:
+        return None
+
+
 def traduzir(texto, origem, destino):
     # 1.º tenta o Google; se falhar (limite de pedidos), usa o MyMemory
     try:
         return GoogleTranslator(source=origem, target=destino).translate(texto)
     except Exception:
         mm = MyMemoryTranslator(
-            source=NOMES_MM[origem], target=NOMES_MM[destino]
+            source=NOMES_MM[origem],
+            target=NOMES_MM[destino],
+            email=email_mymemory(),
         )
         return " ".join(mm.translate(p) for p in partir_texto(texto))
 
