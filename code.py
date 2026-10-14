@@ -25,7 +25,7 @@ except Exception:
 # ---------------------------------------------------------------
 st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍", layout="centered")
 
-MODEL_PADRAO = "gemini-3.8-flash"
+MODEL_PADRAO = "gemini-2.5-flash"
 TIMEOUT_MS = 8000  # se o Gemini demorar mais, passa para o deep-translator
 STUDY_FILE = "estudo.json"
 # Caixas de Leitner: dias até à próxima revisão
@@ -142,6 +142,7 @@ def traduzir_gemini(texto, alvo):
     idioma = "inglês" if alvo == "en" else "português de Angola"
     prompt = f"Traduz para {idioma}:\n{texto}"
     com_thinking = True
+    ultimo_erro = ""
     for modelo in MODELOS:
         tentativa = 0
         while tentativa < 2:
@@ -152,9 +153,11 @@ def traduzir_gemini(texto, alvo):
                 saida = (r.text or "").strip()
                 if saida:
                     return saida
+                ultimo_erro = f"{modelo}: resposta vazia"
                 break
             except Exception as e:
                 erro = str(e)
+                ultimo_erro = f"{modelo}: {erro[:300]}"
                 if com_thinking and ("thinking" in erro.lower() or "400" in erro):
                     com_thinking = False
                     continue
@@ -163,7 +166,7 @@ def traduzir_gemini(texto, alvo):
                     tentativa += 1
                     continue
                 break  # 504, modelo inexistente, etc.: passa ao seguinte
-    raise RuntimeError("Gemini indisponível")
+    raise RuntimeError(f"Gemini indisponível -> {ultimo_erro}")
 
 
 def traduzir_deep(texto, alvo):
@@ -175,15 +178,20 @@ def traduzir_deep(texto, alvo):
 def translate_cached(texto, direction):
     alvo = alvo_da_direcao(texto, direction)
     motor = "Gemini"
+    erro_gemini = ""
     try:
         if client is None:
-            raise RuntimeError("sem Gemini")
+            raise RuntimeError("client é None (chave não lida dos Secrets?)")
         traducao = traduzir_gemini(texto, alvo)
-    except Exception:
+    except Exception as e:
+        erro_gemini = str(e)
         if GoogleTranslator is None:
             raise
-        traducao = traduzir_deep(texto, alvo)
-        motor = "Google Translate"
+        try:
+            traducao = traduzir_deep(texto, alvo)
+            motor = "Google Translate"
+        except Exception as e2:
+            raise RuntimeError(f"{erro_gemini} | Google Translate: {e2}")
     return {"translation": traducao, "target_lang": alvo, "motor": motor}
 
 
@@ -233,6 +241,7 @@ def page_translate():
     target = res.get("target_lang", "en")
     st.subheader("Tradução")
     st.success(res["translation"])
+    st.caption(f"Motor: {res.get('motor', '?')}")
 
     c1, c2, c3 = st.columns(3)
     with c1:
