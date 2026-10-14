@@ -16,7 +16,6 @@ from gtts import gTTS
 st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍", layout="centered")
 
 MODEL_PADRAO = "gemini-3.8-flash"
-MODEL_RESERVA = "gemini-3.8-flash-lite"  # confirma o nome no Google AI Studio
 STUDY_FILE = "estudo.json"
 # Caixas de Leitner: dias até à próxima revisão
 INTERVALS = {1: 0, 2: 1, 3: 3, 4: 7, 5: 14}
@@ -31,7 +30,8 @@ def get_secret(name, default=""):
 
 API_KEY = get_secret("GEMINI_API_KEY")
 APP_PASSWORD = get_secret("APP_PASSWORD")
-MODELOS = [m for m in dict.fromkeys([get_secret("GEMINI_MODEL", MODEL_PADRAO), MODEL_RESERVA]) if m]
+# Modelo principal + reserva opcional (GEMINI_MODEL_RESERVA nos Secrets)
+MODELOS = [m for m in dict.fromkeys([get_secret("GEMINI_MODEL", MODEL_PADRAO), get_secret("GEMINI_MODEL_RESERVA", "")]) if m]
 
 # ---------------------------------------------------------------
 # Acesso com palavra-passe
@@ -110,10 +110,10 @@ def parse_json(text):
 
 
 def chamar_gemini(prompt):
-    """Tenta cada modelo até 3 vezes; espera 2s, 4s, 6s em caso de 503/429."""
-    ultimo_erro = None
+    """Tenta cada modelo até 5 vezes; espera 2s, 4s, 6s... em caso de 503/429."""
+    primeiro_erro = None
     for modelo in MODELOS:
-        for tentativa in range(3):
+        for tentativa in range(5):
             try:
                 r = client.models.generate_content(
                     model=modelo,
@@ -126,13 +126,14 @@ def chamar_gemini(prompt):
                 )
                 return r.text
             except Exception as e:
-                ultimo_erro = e
+                if primeiro_erro is None:
+                    primeiro_erro = e
                 erro = str(e)
                 if "503" in erro or "429" in erro or "UNAVAILABLE" in erro:
                     time.sleep(2 * (tentativa + 1))
                     continue
                 break  # outro erro (ex.: modelo inexistente): tenta o modelo seguinte
-    raise ultimo_erro
+    raise primeiro_erro
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
