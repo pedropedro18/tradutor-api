@@ -16,9 +16,10 @@ except Exception:  # sem Gemini, a app usa só o deep-translator
     types = None
 
 try:
-    from deep_translator import GoogleTranslator
+    from deep_translator import GoogleTranslator, MyMemoryTranslator
 except Exception:
     GoogleTranslator = None
+    MyMemoryTranslator = None
 
 # ---------------------------------------------------------------
 # Configuração
@@ -26,7 +27,7 @@ except Exception:
 st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍", layout="centered")
 
 MODEL_PADRAO = "gemini-3.8-flash"
-TIMEOUT_MS = 15000  # se o Gemini demorar mais, passa para o deep-translator
+TIMEOUT_MS = 15000  # mínimo permitido pelo Gemini é 10000
 STUDY_FILE = "estudo.json"
 # Caixas de Leitner: dias até à próxima revisão
 INTERVALS = {1: 0, 2: 1, 3: 3, 4: 7, 5: 14}
@@ -98,7 +99,7 @@ if "history" not in st.session_state:
     st.session_state["history"] = []
 
 # ---------------------------------------------------------------
-# Tradução: Gemini (rápido) e, se falhar, deep-translator
+# Tradução: Gemini (rápido) e, se falhar, Google Translate / MyMemory
 # ---------------------------------------------------------------
 PT_PALAVRAS = {
     "o", "a", "os", "as", "um", "uma", "de", "do", "da", "que", "e", "é", "não",
@@ -142,7 +143,7 @@ def traduzir_gemini(texto, alvo):
     idioma = "inglês" if alvo == "en" else "português de Angola"
     prompt = f"Traduz para {idioma}:\n{texto}"
     com_thinking = True
-    ultimo_erro = ""
+    erros = []
     for modelo in MODELOS:
         tentativa = 0
         while tentativa < 2:
@@ -153,11 +154,10 @@ def traduzir_gemini(texto, alvo):
                 saida = (r.text or "").strip()
                 if saida:
                     return saida
-                ultimo_erro = f"{modelo}: resposta vazia"
+                erros.append(f"{modelo}: resposta vazia")
                 break
             except Exception as e:
                 erro = str(e)
-                ultimo_erro = f"{modelo}: {erro[:300]}"
                 if com_thinking and ("thinking" in erro.lower() or "400" in erro):
                     com_thinking = False
                     continue
@@ -165,33 +165,44 @@ def traduzir_gemini(texto, alvo):
                     time.sleep(1)
                     tentativa += 1
                     continue
+                erros.append(f"{modelo}: {erro[:300]}")
                 break  # 504, modelo inexistente, etc.: passa ao seguinte
-    raise RuntimeError(f"Gemini indisponível -> {ultimo_erro}")
+    raise RuntimeError("Gemini indisponível -> " + " || ".join(erros))
 
 
 def traduzir_deep(texto, alvo):
     origem = "pt" if alvo == "en" else "en"
-    return GoogleTranslator(source=origem, target=alvo).translate(texto)
+    erros = []
+    if GoogleTranslator is not None:
+        try:
+            return GoogleTranslator(source=origem, target=alvo).translate(texto)
+        except Exception as e:
+            erros.append(f"Google Translate: {str(e)[:150]}")
+    if MyMemoryTranslator is not None:
+        try:
+            src = "portuguese" if origem == "pt" else "english"
+            dst = "english" if alvo == "en" else "portuguese"
+            return MyMemoryTranslator(source=src, target=dst).translate(texto)
+        except Exception as e:
+            erros.append(f"MyMemory: {str(e)[:150]}")
+    raise RuntimeError(" | ".join(erros) or "Nenhum tradutor disponível")
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def translate_cached(texto, direction):
     alvo = alvo_da_direcao(texto, direction)
     motor = "Gemini"
-    erro_gemini = ""
     try:
         if client is None:
             raise RuntimeError("client é None (chave não lida dos Secrets?)")
         traducao = traduzir_gemini(texto, alvo)
     except Exception as e:
         erro_gemini = str(e)
-        if GoogleTranslator is None:
-            raise
         try:
             traducao = traduzir_deep(texto, alvo)
-            motor = "Google Translate"
+            motor = "Google Translate / MyMemory"
         except Exception as e2:
-            raise RuntimeError(f"{erro_gemini} | Google Translate: {e2}")
+            raise RuntimeError(f"{erro_gemini} | {e2}")
     return {"translation": traducao, "target_lang": alvo, "motor": motor}
 
 
