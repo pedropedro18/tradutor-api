@@ -34,7 +34,7 @@ verificar_acesso()
 
 NOMES = {"pt": "Português", "en": "English"}
 NOMES_MM = {"pt": "portuguese", "en": "english"}
-MODELO_CLAUDE = "claude-haiku-5-5"
+MODELO_GEMINI = "gemini-2.5-flash"
 
 
 # ---------- Tradução ----------
@@ -120,17 +120,24 @@ def traduzir(texto, origem, destino):
     raise RuntimeError(f"Todos os serviços falharam. Último erro: {ultimo_erro}")
 
 
-# ---------- Gramática e exemplos (Claude) ----------
-def chave_claude():
+# ---------- Gramática e exemplos (Gemini) ----------
+def chave_gemini():
     try:
-        return st.secrets.get("ANTHROPIC_API_KEY", None)
+        return st.secrets.get("GEMINI_API_KEY", None)
     except Exception:
         return None
 
 
+def modelo_gemini():
+    try:
+        return st.secrets.get("GEMINI_MODEL", MODELO_GEMINI)
+    except Exception:
+        return MODELO_GEMINI
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def analisar(original, traducao, origem):
-    import anthropic
+    from google import genai
 
     ingles = original if origem == "en" else traducao
     portugues = traducao if origem == "en" else original
@@ -151,13 +158,13 @@ Responde APENAS com JSON válido (sem markdown, sem texto extra), neste formato:
 }}
 Os exemplos devem usar o vocabulário principal do texto, com frases simples."""
 
-    client = anthropic.Anthropic(api_key=chave_claude())
-    msg = client.messages.create(
-        model=MODELO_CLAUDE,
-        max_tokens=1200,
-        messages=[{"role": "user", "content": prompt}],
+    client = genai.Client(api_key=chave_gemini())
+    resp = client.models.generate_content(
+        model=modelo_gemini(),
+        contents=prompt,
+        config={"response_mime_type": "application/json"},
     )
-    texto = "".join(b.text for b in msg.content if b.type == "text")
+    texto = resp.text or ""
     limpo = re.sub(r"json|", "", texto).strip()
     return json.loads(limpo)
 
@@ -231,8 +238,8 @@ if len(st.session_state.get("ultimo", ())) == 4:
             st.toast("Já está guardado.")
 
     if b3.button("📚 Gramática e exemplos"):
-        if not chave_claude():
-            st.warning("Falta a ANTHROPIC_API_KEY nos Secrets da app.")
+        if not chave_gemini():
+            st.warning("Falta a GEMINI_API_KEY nos Secrets da app.")
         else:
             try:
                 with st.spinner("A analisar..."):
