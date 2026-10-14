@@ -98,7 +98,7 @@ Responde APENAS com JSON válido, sem texto extra e sem , com esta estrutura:
  "examples": [{"en": "frase em inglês", "pt": "tradução em português de Angola"}],
  "alternatives": [{"text": "variante em inglês", "register": "formal|neutro|informal"}]
 }
-Regras: explicações da gramática em português de Angola; 3 exemplos curtos; até 3 alternativas;
+Regras: explicações da gramática em português de Angola; 2 exemplos curtos; até 2 alternativas; sê breve;
 mantém o significado e o tom do texto original."""
 
 
@@ -109,29 +109,41 @@ def parse_json(text):
     return json.loads(text[start:end + 1])
 
 
+def _config(com_thinking):
+    kwargs = dict(
+        system_instruction=SYSTEM,
+        response_mime_type="application/json",
+        max_output_tokens=1200,
+        http_options=types.HttpOptions(timeout=45000),
+    )
+    if com_thinking:
+        # Reduz o "pensamento" do modelo para responder mais depressa
+        kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
+    return types.GenerateContentConfig(**kwargs)
+
+
 def chamar_gemini(prompt):
-    """Tenta cada modelo até 3 vezes; espera 1s, 2s, 3s em caso de 503/429."""
+    """Tenta cada modelo até 3 vezes; repete em 503/504/429."""
     primeiro_erro = None
+    com_thinking = True
     for modelo in MODELOS:
-        for tentativa in range(3):
+        tentativa = 0
+        while tentativa < 3:
             try:
                 r = client.models.generate_content(
-                    model=modelo,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        system_instruction=SYSTEM,
-                        response_mime_type="application/json",
-                        max_output_tokens=1200,
-                        http_options=types.HttpOptions(timeout=20000),
-                    ),
+                    model=modelo, contents=prompt, config=_config(com_thinking)
                 )
                 return r.text
             except Exception as e:
+                erro = str(e)
+                if com_thinking and ("thinking" in erro.lower() or "400" in erro):
+                    com_thinking = False  # este modelo não aceita a opção: repete sem ela
+                    continue
                 if primeiro_erro is None:
                     primeiro_erro = e
-                erro = str(e)
-                if "503" in erro or "429" in erro or "UNAVAILABLE" in erro:
+                if any(c in erro for c in ("503", "504", "429", "UNAVAILABLE", "DEADLINE")):
                     time.sleep(1 + tentativa)
+                    tentativa += 1
                     continue
                 break  # outro erro (ex.: modelo inexistente): tenta o modelo seguinte
     raise primeiro_erro
