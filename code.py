@@ -14,6 +14,22 @@ from gtts import gTTS
 st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍")
 st.title("🌍 Tradutor Português ⇄ Inglês")
 
+
+def verificar_acesso():
+    if st.session_state.get("autorizado"):
+        return
+    senha = st.text_input("Palavra-passe", type="password")
+    if st.button("Entrar"):
+        if senha == st.secrets.get("APP_PASSWORD", ""):
+            st.session_state.autorizado = True
+            st.rerun()
+        else:
+            st.error("Palavra-passe errada.")
+    st.stop()
+
+
+verificar_acesso()
+
 NOMES = {"pt": "Português", "en": "English"}
 NOMES_MM = {"pt": "portuguese", "en": "english"}
 
