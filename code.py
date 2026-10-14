@@ -1,4 +1,5 @@
 import io
+import json
 import re
 import time
 
@@ -15,6 +16,7 @@ st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍")
 st.title("🌍 Tradutor Português ⇄ Inglês")
 
 
+# ---------- Palavra-passe ----------
 def verificar_acesso():
     if st.session_state.get("autorizado"):
         return
@@ -32,8 +34,10 @@ verificar_acesso()
 
 NOMES = {"pt": "Português", "en": "English"}
 NOMES_MM = {"pt": "portuguese", "en": "english"}
+MODELO_CLAUDE = "claude-haiku-5-5"
 
 
+# ---------- Tradução ----------
 def partir_texto(texto, limite=450):
     """Divide o texto em pedaços pequenos (o MyMemory aceita ~500 caracteres)."""
     frases = re.split(r"(?<=[.!?])\s+|\n", texto)
@@ -53,7 +57,6 @@ def partir_texto(texto, limite=450):
 
 
 def email_mymemory():
-    # Opcional: com email o MyMemory permite muito mais pedidos por dia
     try:
         return st.secrets.get("MYMEMORY_EMAIL", None)
     except Exception:
@@ -89,14 +92,12 @@ def via_mymemory(texto, origem, destino):
 
 
 def via_linguee(texto, origem, destino):
-    # Bom para palavras soltas e expressões curtas
     return LingueeTranslator(
         source=NOMES_MM[origem], target=NOMES_MM[destino]
     ).translate(texto, return_all=False)
 
 
 def via_pons(texto, origem, destino):
-    # Bom para palavras soltas
     return PonsTranslator(
         source=NOMES_MM[origem], target=NOMES_MM[destino]
     ).translate(texto, return_all=False)
@@ -106,7 +107,6 @@ def via_pons(texto, origem, destino):
 def traduzir(texto, origem, destino):
     """Tenta vários serviços, um a seguir ao outro, até um funcionar."""
     metodos = [via_google, via_mymemory]
-    # Para textos curtos (palavras/expressões), há mais opções
     if len(texto.split()) <= 3:
         metodos += [via_linguee, via_pons]
 
@@ -120,11 +120,59 @@ def traduzir(texto, origem, destino):
     raise RuntimeError(f"Todos os serviços falharam. Último erro: {ultimo_erro}")
 
 
-# Estado
+# ---------- Gramática e exemplos (Claude) ----------
+def chave_claude():
+    try:
+        return st.secrets.get("ANTHROPIC_API_KEY", None)
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def analisar(original, traducao, origem):
+    import anthropic
+
+    ingles = original if origem == "en" else traducao
+    portugues = traducao if origem == "en" else original
+
+    prompt = f"""És professor de inglês em Angola. Analisa este texto.
+
+Inglês: {ingles}
+Português: {portugues}
+
+Responde APENAS com JSON válido (sem markdown, sem texto extra), neste formato:
+{{
+  "gramatica": "explicação em português, em tópicos curtos: classes de palavras importantes, tempo verbal, estrutura da frase e um erro comum a evitar",
+  "exemplos": [
+    {{"en": "frase em inglês", "pt": "tradução em português"}},
+    {{"en": "frase em inglês", "pt": "tradução em português"}},
+    {{"en": "frase em inglês", "pt": "tradução em português"}}
+  ]
+}}
+Os exemplos devem usar o vocabulário principal do texto, com frases simples."""
+
+    client = anthropic.Anthropic(api_key=chave_claude())
+    msg = client.messages.create(
+        model=MODELO_CLAUDE,
+        max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    texto = "".join(b.text for b in msg.content if b.type == "text")
+    limpo = re.sub(r"json|", "", texto).strip()
+    return json.loads(limpo)
+
+
+# ---------- Estado ----------
 if "direcao" not in st.session_state:
     st.session_state.direcao = "pt-en"
 if "historico" not in st.session_state:
     st.session_state.historico = []
+if "estudo" not in st.session_state:
+    st.session_state.estudo = []  # lista de (original, traducao)
+if "cartao" not in st.session_state:
+    st.session_state.cartao = 0
+if "mostrar_resp" not in st.session_state:
+    st.session_state.mostrar_resp = False
 
 
 def inverter():
@@ -149,20 +197,24 @@ if st.button("Traduzir", type="primary"):
         try:
             with st.spinner("A traduzir..."):
                 resultado = traduzir(texto.strip(), origem, destino)
-            st.session_state.ultimo = (resultado, destino)
+            st.session_state.ultimo = (resultado, destino, texto.strip(), origem)
+            st.session_state.analise = None
             st.session_state.historico.insert(
                 0, (NOMES[origem], texto, NOMES[destino], resultado)
             )
         except Exception as e:
             st.error(f"Erro ao traduzir: {e}")
 
+# ---------- Resultado ----------
 if "ultimo" in st.session_state:
-    resultado, lang = st.session_state.ultimo
+    resultado, lang, original, org = st.session_state.ultimo
     st.subheader("Tradução")
     st.success(resultado)
     st.code(resultado, language=None)  # botão de copiar
 
-    if st.button("🔊 Ouvir"):
+    b1, b2, b3 = st.columns(3)
+
+    if b1.button("🔊 Ouvir"):
         try:
             audio = io.BytesIO()
             gTTS(resultado, lang=lang).write_to_fp(audio)
@@ -170,6 +222,56 @@ if "ultimo" in st.session_state:
         except Exception as e:
             st.error(f"Erro no áudio: {e}")
 
+    if b2.button("⭐ Guardar para estudo"):
+        par = (original, resultado)
+        if par not in st.session_state.estudo:
+            st.session_state.estudo.append(par)
+            st.toast("Guardado no modo estudo.")
+        else:
+            st.toast("Já está guardado.")
+
+    if b3.button("📚 Gramática e exemplos"):
+        if not chave_claude():
+            st.warning("Falta a ANTHROPIC_API_KEY nos Secrets da app.")
+        else:
+            try:
+                with st.spinner("A analisar..."):
+                    st.session_state.analise = analisar(original, resultado, org)
+            except Exception as e:
+                st.error(f"Erro na análise: {e}")
+
+    analise = st.session_state.get("analise")
+    if analise:
+        st.subheader("Gramática")
+        st.markdown(analise.get("gramatica", ""))
+        st.subheader("Exemplos")
+        for ex in analise.get("exemplos", []):
+            st.markdown(f"🇬🇧 {ex.get('en', '')}  \n🇦🇴 {ex.get('pt', '')}")
+
+# ---------- Modo estudo ----------
+if st.session_state.estudo:
+    with st.expander(f"🎓 Modo estudo ({len(st.session_state.estudo)})"):
+        i = st.session_state.cartao % len(st.session_state.estudo)
+        frente, verso = st.session_state.estudo[i]
+        st.markdown(f"Cartão {i + 1}/{len(st.session_state.estudo)}")
+        st.info(frente)
+        if st.session_state.mostrar_resp:
+            st.success(verso)
+        c1, c2, c3 = st.columns(3)
+        if c1.button("👁️ Mostrar resposta"):
+            st.session_state.mostrar_resp = True
+            st.rerun()
+        if c2.button("➡️ Próximo"):
+            st.session_state.cartao += 1
+            st.session_state.mostrar_resp = False
+            st.rerun()
+        if c3.button("🗑️ Limpar cartões"):
+            st.session_state.estudo = []
+            st.session_state.cartao = 0
+            st.session_state.mostrar_resp = False
+            st.rerun()
+
+# ---------- Histórico ----------
 if st.session_state.historico:
     with st.expander("Histórico"):
         for de, t, para, r in st.session_state.historico[:10]:
