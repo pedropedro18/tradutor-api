@@ -6,9 +6,19 @@ import time
 from datetime import date, timedelta
 
 import streamlit as st
-from google import genai
-from google.genai import types
 from gtts import gTTS
+
+try:
+    from google import genai
+    from google.genai import types
+except Exception:  # sem Gemini, a app usa só o deep-translator
+    genai = None
+    types = None
+
+try:
+    from deep_translator import GoogleTranslator
+except Exception:
+    GoogleTranslator = None
 
 # ---------------------------------------------------------------
 # Configuração
@@ -16,6 +26,7 @@ from gtts import gTTS
 st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍", layout="centered")
 
 MODEL_PADRAO = "gemini-3.8-flash"
+TIMEOUT_MS = 8000  # se o Gemini demorar mais, passa para o deep-translator
 STUDY_FILE = "estudo.json"
 # Caixas de Leitner: dias até à próxima revisão
 INTERVALS = {1: 0, 2: 1, 3: 3, 4: 7, 5: 14}
@@ -31,10 +42,14 @@ def get_secret(name, default=""):
 API_KEY = get_secret("GEMINI_API_KEY")
 APP_PASSWORD = get_secret("APP_PASSWORD")
 # Modelo principal + reserva opcional (GEMINI_MODEL_RESERVA nos Secrets)
-MODELOS = [m for m in dict.fromkeys([get_secret("GEMINI_MODEL", MODEL_PADRAO), get_secret("GEMINI_MODEL_RESERVA", "")]) if m]
+MODELOS = [
+    m for m in dict.fromkeys(
+        [get_secret("GEMINI_MODEL", MODEL_PADRAO), get_secret("GEMINI_MODEL_RESERVA", "")]
+    ) if m
+]
 
 # ---------------------------------------------------------------
-# Acesso com palavra-passe
+# Acesso com palavra-passe (só se APP_PASSWORD existir nos Secrets)
 # ---------------------------------------------------------------
 if APP_PASSWORD:
     if not st.session_state.get("auth"):
@@ -48,11 +63,10 @@ if APP_PASSWORD:
                 st.error("Palavra-passe incorreta.")
         st.stop()
 
-if not API_KEY:
-    st.error("Falta a chave GEMINI_API_KEY (em Secrets ou variável de ambiente).")
+client = genai.Client(api_key=API_KEY) if (genai and API_KEY) else None
+if client is None and GoogleTranslator is None:
+    st.error("Falta a chave GEMINI_API_KEY ou o pacote deep-translator.")
     st.stop()
-
-client = genai.Client(api_key=API_KEY)
 
 
 # ---------------------------------------------------------------
@@ -84,87 +98,99 @@ if "history" not in st.session_state:
     st.session_state["history"] = []
 
 # ---------------------------------------------------------------
-# Gemini: tradução (rápida) e gramática (só quando pedida)
+# Tradução: Gemini (rápido) e, se falhar, deep-translator
 # ---------------------------------------------------------------
-SYSTEM_TRAD = """És um tradutor entre português de Angola e inglês.
-Recebes um texto e a direção pedida (auto, pt_en ou en_pt).
-Responde APENAS com JSON válido, sem texto extra e sem , com esta estrutura:
-{"source_lang": "pt" ou "en", "target_lang": "pt" ou "en",
- "translation": "tradução natural", "cefr": "A1|A2|B1|B2|C1|C2 (nível da frase em inglês)"}
-Mantém o significado e o tom do texto original."""
-
-SYSTEM_GRAM = """És professor de inglês para falantes de português de Angola.
-Recebes uma frase em português e a sua versão em inglês.
-Responde APENAS com JSON válido, sem texto extra e sem , com esta estrutura:
-{"grammar": ["classes de palavras ...", "tempo verbal ...", "estrutura ...", "erro comum a evitar ..."],
- "examples": [{"en": "frase em inglês", "pt": "tradução em português de Angola"}],
- "alternatives": [{"text": "variante em inglês", "register": "formal|neutro|informal"}]}
-Regras: explica a gramática em português de Angola, sê breve; 2 exemplos curtos; até 2 alternativas."""
+PT_PALAVRAS = {
+    "o", "a", "os", "as", "um", "uma", "de", "do", "da", "que", "e", "é", "não",
+    "para", "com", "em", "eu", "tu", "ele", "ela", "nós", "você", "estou", "está",
+    "estás", "tenho", "tem", "quero", "gosto", "bom", "boa", "obrigado", "obrigada",
+    "ir", "jogar", "casa", "como", "onde", "quando", "porque", "muito", "meu", "minha",
+}
 
 
-def parse_json(text):
-    text = text.strip()
-    text = re.sub(r"^(?:json)?|$", "", text, flags=re.MULTILINE).strip()
-    start, end = text.find("{"), text.rfind("}")
-    return json.loads(text[start:end + 1])
+def parece_portugues(texto):
+    t = texto.lower()
+    if re.search(r"[ãõçáéíóúâêô]", t):
+        return True
+    palavras = set(re.findall(r"[a-zçãõáéíóúâêô]+", t))
+    return len(palavras & PT_PALAVRAS) > 0
 
 
-def _config(com_thinking, system, max_tokens):
+def alvo_da_direcao(texto, direction):
+    if direction == "pt_en":
+        return "en"
+    if direction == "en_pt":
+        return "pt"
+    return "en" if parece_portugues(texto) else "pt"
+
+
+def _config(com_thinking):
     kwargs = dict(
-        system_instruction=system,
-        response_mime_type="application/json",
-        max_output_tokens=max_tokens,
-        http_options=types.HttpOptions(timeout=45000),
+        system_instruction=(
+            "És um tradutor entre português de Angola e inglês. "
+            "Responde APENAS com a tradução, sem explicações, sem aspas e sem notas."
+        ),
+        max_output_tokens=300,
+        http_options=types.HttpOptions(timeout=TIMEOUT_MS),
     )
     if com_thinking:
-        # Reduz o "pensamento" do modelo para responder mais depressa
         kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
     return types.GenerateContentConfig(**kwargs)
 
 
-def chamar_gemini(prompt, system, max_tokens=600):
-    """Tenta cada modelo até 3 vezes; repete em 503/504/429."""
-    primeiro_erro = None
+def traduzir_gemini(texto, alvo):
+    idioma = "inglês" if alvo == "en" else "português de Angola"
+    prompt = f"Traduz para {idioma}:\n{texto}"
     com_thinking = True
     for modelo in MODELOS:
         tentativa = 0
-        while tentativa < 3:
+        while tentativa < 2:
             try:
                 r = client.models.generate_content(
-                    model=modelo, contents=prompt, config=_config(com_thinking, system, max_tokens)
+                    model=modelo, contents=prompt, config=_config(com_thinking)
                 )
-                return r.text
+                saida = (r.text or "").strip()
+                if saida:
+                    return saida
+                break
             except Exception as e:
                 erro = str(e)
                 if com_thinking and ("thinking" in erro.lower() or "400" in erro):
-                    com_thinking = False  # este modelo não aceita a opção: repete sem ela
+                    com_thinking = False
                     continue
-                if primeiro_erro is None:
-                    primeiro_erro = e
-                if any(c in erro for c in ("503", "504", "429", "UNAVAILABLE", "DEADLINE")):
-                    time.sleep(1 + tentativa)
+                if any(c in erro for c in ("503", "429", "UNAVAILABLE")) and tentativa == 0:
+                    time.sleep(1)
                     tentativa += 1
                     continue
-                break  # outro erro (ex.: modelo inexistente): tenta o modelo seguinte
-    raise primeiro_erro
+                break  # 504, modelo inexistente, etc.: passa ao seguinte
+    raise RuntimeError("Gemini indisponível")
+
+
+def traduzir_deep(texto, alvo):
+    origem = "pt" if alvo == "en" else "en"
+    return GoogleTranslator(source=origem, target=alvo).translate(texto)
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def translate_cached(text, direction):
-    raw = chamar_gemini(f"Direção: {direction}\nTexto: {text}", SYSTEM_TRAD, 300)
-    return parse_json(raw)
+def translate_cached(texto, direction):
+    alvo = alvo_da_direcao(texto, direction)
+    motor = "Gemini"
+    try:
+        if client is None:
+            raise RuntimeError("sem Gemini")
+        traducao = traduzir_gemini(texto, alvo)
+    except Exception:
+        if GoogleTranslator is None:
+            raise
+        traducao = traduzir_deep(texto, alvo)
+        motor = "Google Translate"
+    return {"translation": traducao, "target_lang": alvo, "motor": motor}
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def grammar_cached(pt_text, en_text):
-    raw = chamar_gemini(f"Português: {pt_text}\nInglês: {en_text}", SYSTEM_GRAM, 900)
-    return parse_json(raw)
-
-
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def speak(text, lang, slow=False):
+def speak(texto, lang, slow=False):
     buf = io.BytesIO()
-    gTTS(text=text, lang=lang, slow=slow).write_to_fp(buf)
+    gTTS(text=texto, lang=lang, slow=slow).write_to_fp(buf)
     return buf.getvalue()
 
 
@@ -180,8 +206,7 @@ DIRECTIONS = {
 
 def page_translate():
     st.title("🌍 Tradutor PT ⇄ EN")
-    col1, col2 = st.columns([3, 1])
-    direction_label = col1.selectbox("Direção", list(DIRECTIONS.keys()))
+    direction_label = st.selectbox("Direção", list(DIRECTIONS.keys()))
     text = st.text_area("Texto", height=120, placeholder="Escreve aqui...")
 
     if st.button("Traduzir", type="primary"):
@@ -191,9 +216,9 @@ def page_translate():
             try:
                 with st.spinner("A traduzir..."):
                     res = translate_cached(text.strip(), DIRECTIONS[direction_label])
+                res = dict(res)
                 res["original"] = text.strip()
                 st.session_state["result"] = res
-                st.session_state["show_gram"] = False
                 st.session_state["audio"] = None
                 hist = st.session_state["history"]
                 hist.insert(0, {"original": res["original"], "translation": res["translation"]})
@@ -205,28 +230,30 @@ def page_translate():
     if not res:
         return
 
+    target = res.get("target_lang", "en")
     st.subheader("Tradução")
     st.success(res["translation"])
-    st.caption(f"Nível CEFR da frase em inglês: *{res.get('cefr', '?')}*")
 
     c1, c2, c3 = st.columns(3)
-    target = res.get("target_lang", "en")
     with c1:
         if st.button("🔊 Ouvir"):
-            st.session_state["audio"] = speak(res["translation"], target, False)
+            try:
+                st.session_state["audio"] = speak(res["translation"], target, False)
+            except Exception:
+                st.warning("Não foi possível gerar o áudio agora.")
     with c2:
         if st.button("🐢 Ouvir devagar"):
-            st.session_state["audio"] = speak(res["translation"], target, True)
+            try:
+                st.session_state["audio"] = speak(res["translation"], target, True)
+            except Exception:
+                st.warning("Não foi possível gerar o áudio agora.")
     with c3:
         if st.button("⭐ Guardar"):
             en = res["translation"] if target == "en" else res["original"]
             pt = res["original"] if target == "en" else res["translation"]
             cards = st.session_state["cards"]
             if not any(c["en"] == en for c in cards):
-                cards.append({
-                    "en": en, "pt": pt, "cefr": res.get("cefr", ""),
-                    "box": 1, "due": date.today().isoformat(),
-                })
+                cards.append({"en": en, "pt": pt, "box": 1, "due": date.today().isoformat()})
                 save_cards(cards)
                 st.toast("Guardado para estudo!")
             else:
@@ -234,29 +261,6 @@ def page_translate():
 
     if st.session_state.get("audio"):
         st.audio(st.session_state["audio"], format="audio/mp3")
-
-    if st.button("📚 Gramática e exemplos"):
-        st.session_state["show_gram"] = True
-
-    if st.session_state.get("show_gram"):
-        en = res["translation"] if target == "en" else res["original"]
-        pt = res["original"] if target == "en" else res["translation"]
-        try:
-            with st.spinner("A preparar a gramática..."):
-                g = grammar_cached(pt, en)
-            st.markdown("#### Gramática")
-            for item in g.get("grammar", []):
-                st.markdown(f"- {item}")
-            st.markdown("#### Exemplos")
-            for ex in g.get("examples", []):
-                st.markdown(f"🇬🇧 *{ex['en']}*  \n🇦🇴 {ex['pt']}")
-            alts = g.get("alternatives", [])
-            if alts:
-                st.markdown("#### Outras formas de dizer")
-                for a in alts:
-                    st.markdown(f"- {a['text']} ({a['register']})")
-        except Exception as e:
-            st.error(f"Erro na gramática: {e}")
 
     if st.session_state["history"]:
         with st.expander("🕘 Histórico"):
@@ -287,7 +291,7 @@ def page_study():
 
     card = cards[idx]
     st.markdown(f"### {card['pt']}")
-    st.caption(f"Caixa {card.get('box', 1)} · Nível {card.get('cefr', '')}")
+    st.caption(f"Caixa {card.get('box', 1)}")
     answer = st.text_input("Escreve em inglês (opcional)", key=f"ans_{idx}")
 
     if st.button("Mostrar resposta"):
@@ -300,7 +304,10 @@ def page_study():
                 st.write("✅ Igual!")
             else:
                 st.write("Compara com a tua resposta acima.")
-        st.audio(speak(card["en"], "en"), format="audio/mp3")
+        try:
+            st.audio(speak(card["en"], "en"), format="audio/mp3")
+        except Exception:
+            pass
 
         k1, k2 = st.columns(2)
         if k1.button("❌ Não sabia"):
@@ -328,15 +335,13 @@ def page_saved():
 
     for i, c in enumerate(cards):
         a, b = st.columns([6, 1])
-        a.write(f"*{c['en']}*  \n{c['pt']}  (CEFR {c.get('cefr', '')})")
+        a.write(f"*{c['en']}*  \n{c['pt']}")
         if b.button("🗑️", key=f"del_{i}"):
             cards.pop(i)
             save_cards(cards)
             st.rerun()
 
-    csv = "inglês;português;nível\n" + "\n".join(
-        f"{c['en']};{c['pt']};{c.get('cefr', '')}" for c in cards
-    )
+    csv = "inglês;português\n" + "\n".join(f"{c['en']};{c['pt']}" for c in cards)
     st.download_button("⬇️ Exportar CSV (Excel)", csv.encode("utf-8-sig"),
                        "frases_guardadas.csv", "text/csv")
 
