@@ -1,289 +1,321 @@
 import io
 import json
+import os
 import re
 import time
+from datetime import date, timedelta
 
 import streamlit as st
-from deep_translator import (
-    GoogleTranslator,
-    LingueeTranslator,
-    MyMemoryTranslator,
-    PonsTranslator,
-)
+from google import genai
+from google.genai import types
 from gtts import gTTS
 
-st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍")
-st.title("🌍 Tradutor Português ⇄ Inglês")
+# ---------------------------------------------------------------
+# Configuração
+# ---------------------------------------------------------------
+st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍", layout="centered")
+
+MODEL_PADRAO = "gemini-3.8-flash"
+MODEL_RESERVA = "gemini-3.8-flash-lite"  # confirma o nome no Google AI Studio
+STUDY_FILE = "estudo.json"
+# Caixas de Leitner: dias até à próxima revisão
+INTERVALS = {1: 0, 2: 1, 3: 3, 4: 7, 5: 14}
 
 
-# ---------- Palavra-passe ----------
-def verificar_acesso():
-    if st.session_state.get("autorizado"):
-        return
-    senha = st.text_input("Palavra-passe", type="password")
-    if st.button("Entrar"):
-        if senha == st.secrets.get("APP_PASSWORD", ""):
-            st.session_state.autorizado = True
-            st.rerun()
-        else:
-            st.error("Palavra-passe errada.")
+def get_secret(name, default=""):
+    try:
+        return st.secrets[name]
+    except Exception:
+        return os.environ.get(name, default)
+
+
+API_KEY = get_secret("GEMINI_API_KEY")
+APP_PASSWORD = get_secret("APP_PASSWORD")
+MODELOS = [m for m in dict.fromkeys([get_secret("GEMINI_MODEL", MODEL_PADRAO), MODEL_RESERVA]) if m]
+
+# ---------------------------------------------------------------
+# Acesso com palavra-passe
+# ---------------------------------------------------------------
+if APP_PASSWORD:
+    if not st.session_state.get("auth"):
+        st.title("🔒 Tradutor PT ⇄ EN")
+        pwd = st.text_input("Palavra-passe", type="password")
+        if st.button("Entrar"):
+            if pwd == APP_PASSWORD:
+                st.session_state["auth"] = True
+                st.rerun()
+            else:
+                st.error("Palavra-passe incorreta.")
+        st.stop()
+
+if not API_KEY:
+    st.error("Falta a chave GEMINI_API_KEY (em Secrets ou variável de ambiente).")
     st.stop()
 
-
-verificar_acesso()
-
-NOMES = {"pt": "Português", "en": "English"}
-NOMES_MM = {"pt": "portuguese", "en": "english"}
-MODELO_GEMINI = "gemini-3.8-flash"
+client = genai.Client(api_key=API_KEY)
 
 
-# ---------- Tradução ----------
-def partir_texto(texto, limite=450):
-    """Divide o texto em pedaços pequenos (o MyMemory aceita ~500 caracteres)."""
-    frases = re.split(r"(?<=[.!?])\s+|\n", texto)
-    pedacos, atual = [], ""
-    for f in frases:
-        if not f.strip():
-            continue
-        if len(atual) + len(f) + 1 <= limite:
-            atual = f"{atual} {f}".strip()
-        else:
-            if atual:
-                pedacos.append(atual)
-            atual = f[:limite]
-    if atual:
-        pedacos.append(atual)
-    return pedacos
-
-
-def email_mymemory():
-    try:
-        return st.secrets.get("MYMEMORY_EMAIL", None)
-    except Exception:
-        return None
-
-
-def tentar(funcao, tentativas=2, espera=1.5):
-    """Tenta de novo depois de uma pequena pausa (ajuda com limite de pedidos)."""
-    ultimo_erro = None
-    for i in range(tentativas):
+# ---------------------------------------------------------------
+# Guardar / carregar cartões de estudo
+# ---------------------------------------------------------------
+def load_cards():
+    if os.path.exists(STUDY_FILE):
         try:
-            resultado = funcao()
-            if resultado and str(resultado).strip():
-                return resultado
-        except Exception as e:
-            ultimo_erro = e
-        if i < tentativas - 1:
-            time.sleep(espera)
-    raise ultimo_erro or RuntimeError("Sem resultado")
+            with open(STUDY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
 
 
-def via_google(texto, origem, destino):
-    return GoogleTranslator(source=origem, target=destino).translate(texto)
+def save_cards(cards):
+    try:
+        with open(STUDY_FILE, "w", encoding="utf-8") as f:
+            json.dump(cards, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
 
 
-def via_mymemory(texto, origem, destino):
-    mm = MyMemoryTranslator(
-        source=NOMES_MM[origem],
-        target=NOMES_MM[destino],
-        email=email_mymemory(),
-    )
-    return " ".join(mm.translate(p) for p in partir_texto(texto))
+if "cards" not in st.session_state:
+    st.session_state["cards"] = load_cards()
+if "result" not in st.session_state:
+    st.session_state["result"] = None
+if "history" not in st.session_state:
+    st.session_state["history"] = []
+
+# ---------------------------------------------------------------
+# Claude: tradução + gramática + exemplos + nível CEFR
+# ---------------------------------------------------------------
+SYSTEM = """És um tradutor e professor de inglês para falantes de português de Angola.
+Recebes um texto e a direção pedida (auto, pt_en ou en_pt).
+Responde APENAS com JSON válido, sem texto extra e sem , com esta estrutura:
+{
+ "source_lang": "pt" ou "en",
+ "target_lang": "pt" ou "en",
+ "translation": "tradução natural",
+ "cefr": "A1|A2|B1|B2|C1|C2 (nível da frase em inglês)",
+ "grammar": ["classes de palavras ...", "tempo verbal ...", "estrutura ...", "erro comum a evitar ..."],
+ "examples": [{"en": "frase em inglês", "pt": "tradução em português de Angola"}],
+ "alternatives": [{"text": "variante em inglês", "register": "formal|neutro|informal"}]
+}
+Regras: explicações da gramática em português de Angola; 3 exemplos curtos; até 3 alternativas;
+mantém o significado e o tom do texto original."""
 
 
-def via_linguee(texto, origem, destino):
-    return LingueeTranslator(
-        source=NOMES_MM[origem], target=NOMES_MM[destino]
-    ).translate(texto, return_all=False)
+def parse_json(text):
+    text = text.strip()
+    text = re.sub(r"^(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+    start, end = text.find("{"), text.rfind("}")
+    return json.loads(text[start:end + 1])
 
 
-def via_pons(texto, origem, destino):
-    return PonsTranslator(
-        source=NOMES_MM[origem], target=NOMES_MM[destino]
-    ).translate(texto, return_all=False)
+def chamar_gemini(prompt):
+    """Tenta cada modelo até 3 vezes; espera 2s, 4s, 6s em caso de 503/429."""
+    ultimo_erro = None
+    for modelo in MODELOS:
+        for tentativa in range(3):
+            try:
+                r = client.models.generate_content(
+                    model=modelo,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM,
+                        response_mime_type="application/json",
+                        max_output_tokens=1500,
+                    ),
+                )
+                return r.text
+            except Exception as e:
+                ultimo_erro = e
+                erro = str(e)
+                if "503" in erro or "429" in erro or "UNAVAILABLE" in erro:
+                    time.sleep(2 * (tentativa + 1))
+                    continue
+                break  # outro erro (ex.: modelo inexistente): tenta o modelo seguinte
+    raise ultimo_erro
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def traduzir(texto, origem, destino):
-    """Tenta vários serviços, um a seguir ao outro, até um funcionar."""
-    metodos = [via_google, via_mymemory]
-    if len(texto.split()) <= 3:
-        metodos += [via_linguee, via_pons]
-
-    ultimo_erro = None
-    for metodo in metodos:
-        try:
-            return tentar(lambda m=metodo: m(texto, origem, destino))
-        except Exception as e:
-            ultimo_erro = e
-
-    raise RuntimeError(f"Todos os serviços falharam. Último erro: {ultimo_erro}")
-
-
-# ---------- Gramática e exemplos (Gemini) ----------
-def chave_gemini():
-    try:
-        return st.secrets.get("GEMINI_API_KEY", None)
-    except Exception:
-        return None
-
-
-def modelo_gemini():
-    try:
-        return st.secrets.get("GEMINI_MODEL", MODELO_GEMINI)
-    except Exception:
-        return MODELO_GEMINI
+def translate_cached(text, direction):
+    raw = chamar_gemini(f"Direção: {direction}\nTexto: {text}")
+    return parse_json(raw)
 
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def analisar(original, traducao, origem):
-    from google import genai
-
-    ingles = original if origem == "en" else traducao
-    portugues = traducao if origem == "en" else original
-
-    prompt = f"""És professor de inglês em Angola. Analisa este texto.
-
-Inglês: {ingles}
-Português: {portugues}
-
-Responde APENAS com JSON válido (sem markdown, sem texto extra), neste formato:
-{{
-  "gramatica": "explicação em português, em tópicos curtos: classes de palavras importantes, tempo verbal, estrutura da frase e um erro comum a evitar",
-  "exemplos": [
-    {{"en": "frase em inglês", "pt": "tradução em português"}},
-    {{"en": "frase em inglês", "pt": "tradução em português"}},
-    {{"en": "frase em inglês", "pt": "tradução em português"}}
-  ]
-}}
-Os exemplos devem usar o vocabulário principal do texto, com frases simples."""
-
-    client = genai.Client(api_key=chave_gemini())
-    resp = client.models.generate_content(
-        model=modelo_gemini(),
-        contents=prompt,
-        config={"response_mime_type": "application/json"},
-    )
-    texto = resp.text or ""
-    limpo = re.sub(r"json|", "", texto).strip()
-    return json.loads(limpo)
+def speak(text, lang, slow=False):
+    buf = io.BytesIO()
+    gTTS(text=text, lang=lang, slow=slow).write_to_fp(buf)
+    return buf.getvalue()
 
 
-# ---------- Estado ----------
-if "direcao" not in st.session_state:
-    st.session_state.direcao = "pt-en"
-if "historico" not in st.session_state:
-    st.session_state.historico = []
-if "estudo" not in st.session_state:
-    st.session_state.estudo = []  # lista de (original, traducao)
-if "cartao" not in st.session_state:
-    st.session_state.cartao = 0
-if "mostrar_resp" not in st.session_state:
-    st.session_state.mostrar_resp = False
+# ---------------------------------------------------------------
+# Páginas
+# ---------------------------------------------------------------
+DIRECTIONS = {
+    "Automático": "auto",
+    "Português → Inglês": "pt_en",
+    "Inglês → Português": "en_pt",
+}
 
 
-def inverter():
-    st.session_state.direcao = (
-        "en-pt" if st.session_state.direcao == "pt-en" else "pt-en"
-    )
+def page_translate():
+    st.title("🌍 Tradutor PT ⇄ EN")
+    col1, col2 = st.columns([3, 1])
+    direction_label = col1.selectbox("Direção", list(DIRECTIONS.keys()))
+    text = st.text_area("Texto", height=120, placeholder="Escreve aqui...")
 
-
-origem, destino = st.session_state.direcao.split("-")
-
-col1, col2, col3 = st.columns([5, 2, 5])
-col1.markdown(f"De: {NOMES[origem]}")
-col2.button("⇄ Inverter", on_click=inverter)
-col3.markdown(f"Para: {NOMES[destino]}")
-
-texto = st.text_area("Texto", height=150, placeholder="Escreve aqui...")
-
-if st.button("Traduzir", type="primary"):
-    if not texto.strip():
-        st.warning("Escreve um texto primeiro.")
-    else:
-        try:
-            with st.spinner("A traduzir..."):
-                resultado = traduzir(texto.strip(), origem, destino)
-            st.session_state.ultimo = (resultado, destino, texto.strip(), origem)
-            st.session_state.analise = None
-            st.session_state.historico.insert(
-                0, (NOMES[origem], texto, NOMES[destino], resultado)
-            )
-        except Exception as e:
-            st.error(f"Erro ao traduzir: {e}")
-
-# ---------- Resultado ----------
-if len(st.session_state.get("ultimo", ())) == 4:
-    resultado, lang, original, org = st.session_state.ultimo
-    st.subheader("Tradução")
-    st.success(resultado)
-    st.code(resultado, language=None)  # botão de copiar
-
-    b1, b2, b3 = st.columns(3)
-
-    if b1.button("🔊 Ouvir"):
-        try:
-            audio = io.BytesIO()
-            gTTS(resultado, lang=lang).write_to_fp(audio)
-            st.audio(audio.getvalue(), format="audio/mp3")
-        except Exception as e:
-            st.error(f"Erro no áudio: {e}")
-
-    if b2.button("⭐ Guardar para estudo"):
-        par = (original, resultado)
-        if par not in st.session_state.estudo:
-            st.session_state.estudo.append(par)
-            st.toast("Guardado no modo estudo.")
-        else:
-            st.toast("Já está guardado.")
-
-    if b3.button("📚 Gramática e exemplos"):
-        if not chave_gemini():
-            st.warning("Falta a GEMINI_API_KEY nos Secrets da app.")
+    if st.button("Traduzir", type="primary"):
+        if not text.strip():
+            st.warning("Escreve um texto primeiro.")
         else:
             try:
-                with st.spinner("A analisar..."):
-                    st.session_state.analise = analisar(original, resultado, org)
+                with st.spinner("A traduzir..."):
+                    res = translate_cached(text.strip(), DIRECTIONS[direction_label])
+                res["original"] = text.strip()
+                st.session_state["result"] = res
+                hist = st.session_state["history"]
+                hist.insert(0, {"original": res["original"], "translation": res["translation"]})
+                st.session_state["history"] = hist[:30]
             except Exception as e:
-                st.error(f"Erro na análise: {e}")
+                st.error(f"Erro ao traduzir: {e}")
 
-    analise = st.session_state.get("analise")
-    if analise:
-        st.subheader("Gramática")
-        st.markdown(analise.get("gramatica", ""))
-        st.subheader("Exemplos")
-        for ex in analise.get("exemplos", []):
-            st.markdown(f"🇬🇧 {ex.get('en', '')}  \n🇦🇴 {ex.get('pt', '')}")
+    res = st.session_state["result"]
+    if not res:
+        return
 
-# ---------- Modo estudo ----------
-if st.session_state.estudo:
-    with st.expander(f"🎓 Modo estudo ({len(st.session_state.estudo)})"):
-        i = st.session_state.cartao % len(st.session_state.estudo)
-        frente, verso = st.session_state.estudo[i]
-        st.markdown(f"Cartão {i + 1}/{len(st.session_state.estudo)}")
-        st.info(frente)
-        if st.session_state.mostrar_resp:
-            st.success(verso)
-        c1, c2, c3 = st.columns(3)
-        if c1.button("👁️ Mostrar resposta"):
-            st.session_state.mostrar_resp = True
+    st.subheader("Tradução")
+    st.success(res["translation"])
+    st.caption(f"Nível CEFR da frase em inglês: *{res.get('cefr', '?')}*")
+
+    c1, c2, c3 = st.columns(3)
+    target = res.get("target_lang", "en")
+    with c1:
+        if st.button("🔊 Ouvir"):
+            st.session_state["audio"] = speak(res["translation"], target, False)
+    with c2:
+        if st.button("🐢 Ouvir devagar"):
+            st.session_state["audio"] = speak(res["translation"], target, True)
+    with c3:
+        if st.button("⭐ Guardar"):
+            en = res["translation"] if target == "en" else res["original"]
+            pt = res["original"] if target == "en" else res["translation"]
+            cards = st.session_state["cards"]
+            if not any(c["en"] == en for c in cards):
+                cards.append({
+                    "en": en, "pt": pt, "cefr": res.get("cefr", ""),
+                    "box": 1, "due": date.today().isoformat(),
+                })
+                save_cards(cards)
+                st.toast("Guardado para estudo!")
+            else:
+                st.toast("Já estava guardado.")
+
+    if st.session_state.get("audio"):
+        st.audio(st.session_state["audio"], format="audio/mp3")
+
+    with st.expander("📚 Gramática e exemplos", expanded=True):
+        st.markdown("#### Gramática")
+        for item in res.get("grammar", []):
+            st.markdown(f"- {item}")
+        st.markdown("#### Exemplos")
+        for ex in res.get("examples", []):
+            st.markdown(f"🇬🇧 *{ex['en']}*  \n🇦🇴 {ex['pt']}")
+        alts = res.get("alternatives", [])
+        if alts:
+            st.markdown("#### Outras formas de dizer")
+            for a in alts:
+                st.markdown(f"- {a['text']} ({a['register']})")
+
+    if st.session_state["history"]:
+        with st.expander("🕘 Histórico"):
+            for h in st.session_state["history"]:
+                st.write(f"{h['original']}  →  *{h['translation']}*")
+
+
+def page_study():
+    st.title("🧠 Modo de estudo")
+    cards = st.session_state["cards"]
+    if not cards:
+        st.info("Ainda não guardaste frases. Traduz e carrega em ⭐ Guardar.")
+        return
+
+    today = date.today().isoformat()
+    due = [i for i, c in enumerate(cards) if c.get("due", today) <= today]
+    st.caption(f"{len(due)} para rever hoje · {len(cards)} no total")
+
+    if not due:
+        st.success("Parabéns! Não há mais cartões para hoje. 🎉")
+        return
+
+    idx = st.session_state.get("study_idx")
+    if idx not in due:
+        idx = due[0]
+        st.session_state["study_idx"] = idx
+        st.session_state["show_answer"] = False
+
+    card = cards[idx]
+    st.markdown(f"### {card['pt']}")
+    st.caption(f"Caixa {card.get('box', 1)} · Nível {card.get('cefr', '')}")
+    answer = st.text_input("Escreve em inglês (opcional)", key=f"ans_{idx}")
+
+    if st.button("Mostrar resposta"):
+        st.session_state["show_answer"] = True
+
+    if st.session_state.get("show_answer"):
+        st.success(card["en"])
+        if answer.strip():
+            if answer.strip().lower().rstrip(".!?") == card["en"].lower().rstrip(".!?"):
+                st.write("✅ Igual!")
+            else:
+                st.write("Compara com a tua resposta acima.")
+        st.audio(speak(card["en"], "en"), format="audio/mp3")
+
+        k1, k2 = st.columns(2)
+        if k1.button("❌ Não sabia"):
+            card["box"] = 1
+            card["due"] = today
+            save_cards(cards)
+            st.session_state["show_answer"] = False
+            st.session_state["study_idx"] = None
             st.rerun()
-        if c2.button("➡️ Próximo"):
-            st.session_state.cartao += 1
-            st.session_state.mostrar_resp = False
-            st.rerun()
-        if c3.button("🗑️ Limpar cartões"):
-            st.session_state.estudo = []
-            st.session_state.cartao = 0
-            st.session_state.mostrar_resp = False
+        if k2.button("✅ Sabia"):
+            card["box"] = min(card.get("box", 1) + 1, 5)
+            card["due"] = (date.today() + timedelta(days=INTERVALS[card["box"]])).isoformat()
+            save_cards(cards)
+            st.session_state["show_answer"] = False
+            st.session_state["study_idx"] = None
             st.rerun()
 
-# ---------- Histórico ----------
-if st.session_state.historico:
-    with st.expander("Histórico"):
-        for de, t, para, r in st.session_state.historico[:10]:
-            st.markdown(f"{de}: {t}  \n*{para}:* {r}")
-            st.divider()
-        if st.button("Limpar histórico"):
-            st.session_state.historico = []
+
+def page_saved():
+    st.title("⭐ Frases guardadas")
+    cards = st.session_state["cards"]
+    if not cards:
+        st.info("Nada guardado ainda.")
+        return
+
+    for i, c in enumerate(cards):
+        a, b = st.columns([6, 1])
+        a.write(f"*{c['en']}*  \n{c['pt']}  (CEFR {c.get('cefr', '')})")
+        if b.button("🗑️", key=f"del_{i}"):
+            cards.pop(i)
+            save_cards(cards)
             st.rerun()
+
+    csv = "inglês;português;nível\n" + "\n".join(
+        f"{c['en']};{c['pt']};{c.get('cefr', '')}" for c in cards
+    )
+    st.download_button("⬇️ Exportar CSV (Excel)", csv.encode("utf-8-sig"),
+                       "frases_guardadas.csv", "text/csv")
+
+
+# ---------------------------------------------------------------
+# Navegação
+# ---------------------------------------------------------------
+page = st.sidebar.radio("Menu", ["Traduzir", "Estudar", "Guardadas"])
+if page == "Traduzir":
+    page_translate()
+elif page == "Estudar":
+    page_study()
+else:
+    page_saved()
