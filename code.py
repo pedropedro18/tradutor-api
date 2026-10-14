@@ -94,16 +94,14 @@ def traduzir(texto, origem, destino):
     if len(texto.split()) <= 3:
         metodos += [via_linguee, via_pons]
 
-    erros = []
+    ultimo_erro = None
     for metodo in metodos:
         try:
-            return tentar(lambda: metodo(texto, origem, destino))
+            return tentar(lambda m=metodo: m(texto, origem, destino))
         except Exception as e:
-            erros.append(f"{metodo._name_}: {e}")
+            ultimo_erro = e
 
-    raise RuntimeError(
-        "Todos os serviços estão ocupados. Espera um minuto e tenta de novo."
-    )
+    raise RuntimeError(f"Todos os serviços falharam. Último erro: {ultimo_erro}")
 
 
 # Estado
