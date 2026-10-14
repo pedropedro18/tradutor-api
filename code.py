@@ -206,7 +206,7 @@ if st.button("Traduzir", type="primary"):
             st.error(f"Erro ao traduzir: {e}")
 
 # ---------- Resultado ----------
-if "ultimo" in st.session_state:
+if len(st.session_state.get("ultimo", ())) == 4:
     resultado, lang, original, org = st.session_state.ultimo
     st.subheader("Tradução")
     st.success(resultado)
