@@ -84,36 +84,36 @@ if "history" not in st.session_state:
     st.session_state["history"] = []
 
 # ---------------------------------------------------------------
-# Claude: tradução + gramática + exemplos + nível CEFR
+# Gemini: tradução (rápida) e gramática (só quando pedida)
 # ---------------------------------------------------------------
-SYSTEM = """És um tradutor e professor de inglês para falantes de português de Angola.
+SYSTEM_TRAD = """És um tradutor entre português de Angola e inglês.
 Recebes um texto e a direção pedida (auto, pt_en ou en_pt).
 Responde APENAS com JSON válido, sem texto extra e sem , com esta estrutura:
-{
- "source_lang": "pt" ou "en",
- "target_lang": "pt" ou "en",
- "translation": "tradução natural",
- "cefr": "A1|A2|B1|B2|C1|C2 (nível da frase em inglês)",
- "grammar": ["classes de palavras ...", "tempo verbal ...", "estrutura ...", "erro comum a evitar ..."],
+{"source_lang": "pt" ou "en", "target_lang": "pt" ou "en",
+ "translation": "tradução natural", "cefr": "A1|A2|B1|B2|C1|C2 (nível da frase em inglês)"}
+Mantém o significado e o tom do texto original."""
+
+SYSTEM_GRAM = """És professor de inglês para falantes de português de Angola.
+Recebes uma frase em português e a sua versão em inglês.
+Responde APENAS com JSON válido, sem texto extra e sem , com esta estrutura:
+{"grammar": ["classes de palavras ...", "tempo verbal ...", "estrutura ...", "erro comum a evitar ..."],
  "examples": [{"en": "frase em inglês", "pt": "tradução em português de Angola"}],
- "alternatives": [{"text": "variante em inglês", "register": "formal|neutro|informal"}]
-}
-Regras: explicações da gramática em português de Angola; 2 exemplos curtos; até 2 alternativas; sê breve;
-mantém o significado e o tom do texto original."""
+ "alternatives": [{"text": "variante em inglês", "register": "formal|neutro|informal"}]}
+Regras: explica a gramática em português de Angola, sê breve; 2 exemplos curtos; até 2 alternativas."""
 
 
 def parse_json(text):
     text = text.strip()
-    text = re.sub(r"^(?:json)?|```$", "", text, flags=re.MULTILINE).strip()
+    text = re.sub(r"^(?:json)?|$", "", text, flags=re.MULTILINE).strip()
     start, end = text.find("{"), text.rfind("}")
     return json.loads(text[start:end + 1])
 
 
-def _config(com_thinking):
+def _config(com_thinking, system, max_tokens):
     kwargs = dict(
-        system_instruction=SYSTEM,
+        system_instruction=system,
         response_mime_type="application/json",
-        max_output_tokens=1200,
+        max_output_tokens=max_tokens,
         http_options=types.HttpOptions(timeout=45000),
     )
     if com_thinking:
@@ -122,7 +122,7 @@ def _config(com_thinking):
     return types.GenerateContentConfig(**kwargs)
 
 
-def chamar_gemini(prompt):
+def chamar_gemini(prompt, system, max_tokens=600):
     """Tenta cada modelo até 3 vezes; repete em 503/504/429."""
     primeiro_erro = None
     com_thinking = True
@@ -131,7 +131,7 @@ def chamar_gemini(prompt):
         while tentativa < 3:
             try:
                 r = client.models.generate_content(
-                    model=modelo, contents=prompt, config=_config(com_thinking)
+                    model=modelo, contents=prompt, config=_config(com_thinking, system, max_tokens)
                 )
                 return r.text
             except Exception as e:
@@ -151,7 +151,13 @@ def chamar_gemini(prompt):
 
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def translate_cached(text, direction):
-    raw = chamar_gemini(f"Direção: {direction}\nTexto: {text}")
+    raw = chamar_gemini(f"Direção: {direction}\nTexto: {text}", SYSTEM_TRAD, 300)
+    return parse_json(raw)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
+def grammar_cached(pt_text, en_text):
+    raw = chamar_gemini(f"Português: {pt_text}\nInglês: {en_text}", SYSTEM_GRAM, 900)
     return parse_json(raw)
 
 
@@ -187,6 +193,8 @@ def page_translate():
                     res = translate_cached(text.strip(), DIRECTIONS[direction_label])
                 res["original"] = text.strip()
                 st.session_state["result"] = res
+                st.session_state["show_gram"] = False
+                st.session_state["audio"] = None
                 hist = st.session_state["history"]
                 hist.insert(0, {"original": res["original"], "translation": res["translation"]})
                 st.session_state["history"] = hist[:30]
@@ -227,18 +235,28 @@ def page_translate():
     if st.session_state.get("audio"):
         st.audio(st.session_state["audio"], format="audio/mp3")
 
-    with st.expander("📚 Gramática e exemplos", expanded=True):
-        st.markdown("#### Gramática")
-        for item in res.get("grammar", []):
-            st.markdown(f"- {item}")
-        st.markdown("#### Exemplos")
-        for ex in res.get("examples", []):
-            st.markdown(f"🇬🇧 *{ex['en']}*  \n🇦🇴 {ex['pt']}")
-        alts = res.get("alternatives", [])
-        if alts:
-            st.markdown("#### Outras formas de dizer")
-            for a in alts:
-                st.markdown(f"- {a['text']} ({a['register']})")
+    if st.button("📚 Gramática e exemplos"):
+        st.session_state["show_gram"] = True
+
+    if st.session_state.get("show_gram"):
+        en = res["translation"] if target == "en" else res["original"]
+        pt = res["original"] if target == "en" else res["translation"]
+        try:
+            with st.spinner("A preparar a gramática..."):
+                g = grammar_cached(pt, en)
+            st.markdown("#### Gramática")
+            for item in g.get("grammar", []):
+                st.markdown(f"- {item}")
+            st.markdown("#### Exemplos")
+            for ex in g.get("examples", []):
+                st.markdown(f"🇬🇧 *{ex['en']}*  \n🇦🇴 {ex['pt']}")
+            alts = g.get("alternatives", [])
+            if alts:
+                st.markdown("#### Outras formas de dizer")
+                for a in alts:
+                    st.markdown(f"- {a['text']} ({a['register']})")
+        except Exception as e:
+            st.error(f"Erro na gramática: {e}")
 
     if st.session_state["history"]:
         with st.expander("🕘 Histórico"):
