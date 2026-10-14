@@ -34,7 +34,7 @@ verificar_acesso()
 
 NOMES = {"pt": "Português", "en": "English"}
 NOMES_MM = {"pt": "portuguese", "en": "english"}
-MODELO_GEMINI = "gemini-2.5-flash"
+MODELO_GEMINI = "gemini-3.8-flash"
 
 
 # ---------- Tradução ----------
