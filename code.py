@@ -25,8 +25,8 @@ except Exception:
 # ---------------------------------------------------------------
 st.set_page_config(page_title="Tradutor PT ⇄ EN", page_icon="🌍", layout="centered")
 
-MODEL_PADRAO = "gemini-2.5-flash"
-TIMEOUT_MS = 8000  # se o Gemini demorar mais, passa para o deep-translator
+MODEL_PADRAO = "gemini-3.8-flash"
+TIMEOUT_MS = 15000  # se o Gemini demorar mais, passa para o deep-translator
 STUDY_FILE = "estudo.json"
 # Caixas de Leitner: dias até à próxima revisão
 INTERVALS = {1: 0, 2: 1, 3: 3, 4: 7, 5: 14}
