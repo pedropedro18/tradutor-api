@@ -110,10 +110,10 @@ def parse_json(text):
 
 
 def chamar_gemini(prompt):
-    """Tenta cada modelo até 5 vezes; espera 2s, 4s, 6s... em caso de 503/429."""
+    """Tenta cada modelo até 3 vezes; espera 1s, 2s, 3s em caso de 503/429."""
     primeiro_erro = None
     for modelo in MODELOS:
-        for tentativa in range(5):
+        for tentativa in range(3):
             try:
                 r = client.models.generate_content(
                     model=modelo,
@@ -121,7 +121,8 @@ def chamar_gemini(prompt):
                     config=types.GenerateContentConfig(
                         system_instruction=SYSTEM,
                         response_mime_type="application/json",
-                        max_output_tokens=1500,
+                        max_output_tokens=1200,
+                        http_options=types.HttpOptions(timeout=20000),
                     ),
                 )
                 return r.text
@@ -130,7 +131,7 @@ def chamar_gemini(prompt):
                     primeiro_erro = e
                 erro = str(e)
                 if "503" in erro or "429" in erro or "UNAVAILABLE" in erro:
-                    time.sleep(2 * (tentativa + 1))
+                    time.sleep(1 + tentativa)
                     continue
                 break  # outro erro (ex.: modelo inexistente): tenta o modelo seguinte
     raise primeiro_erro
